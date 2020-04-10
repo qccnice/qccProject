@@ -1,0 +1,203 @@
+# coding: utf-8
+import os
+import sys
+import json
+
+MY_DIR = os.path.dirname(os.path.abspath(__file__))
+WORK_DIR = os.path.abspath(os.path.join(MY_DIR, '../'))
+RUNTIME_DIR = os.path.abspath(os.path.join(WORK_DIR, 'runtime'))
+
+sys.path.append(MY_DIR)
+from env_utils import run_cmd
+from env_utils import init_logger
+
+logger = init_logger(logger_name='check_kudu')
+
+
+class CheckKudu(object):
+    def __init__(self):
+        self.valid_data_count = 2 * 60 * 30  # take less than half an hour with opening 2 data files every second
+        self.valid_compression_ratio = 3
+        self.valid_user_tag_tablet_num = 500
+        self.doc = 'https://doc.sensorsdata.cn/pages/viewpage.action?pageId=48601298'
+        self.kudu_varz_file = os.path.join(RUNTIME_DIR, 'kudu_varz.html')
+        self.results_file = os.path.join(RUNTIME_DIR, 'kudu.json')
+        self.results = {
+            'max_tserver_data_count': 0,
+            'tserver_real_data_MByte': 0,
+            'tserver_disk_data_MByte': 0,
+            'tserver_restart_minutes': 0,
+            'tserver_rebuild_minutes': 0,
+            'user_tag_tablet_num': 0,
+            'unmatch': list(),
+        }
+        self.invalid_msg = ['invalid kudu:']
+
+    def check_tserver_on_host(self):
+        cmd = 'curl "$(hostname -f):8050/varz" -o {}'.format(self.kudu_varz_file)
+        logger.debug('check if tserver is running on this host by [{}]'.format(cmd))
+        res = run_cmd(cmd)
+        logger.debug(res)
+
+        if res['ret'] != 0:
+            logger.debug('no tserver on this host')
+            return False
+        else:
+            logger.debug('/varz result is [{}]'.format(self.kudu_varz_file))
+            return True
+
+    def parse_html(self):
+        logger.debug('parse kudu conf from [{}]'.format(self.kudu_varz_file))
+        conf = {
+            "tserver_master_addrs": None,
+            "fs_data_dirs": None,
+        }
+
+        with open(self.kudu_varz_file, 'r', encoding='utf-8') as f:
+            lines = iter(f.readlines())
+
+        while True:
+            try:
+                line = next(lines).strip('\n')
+                if "tserver_master_addrs" in line:
+                    logger.debug(line)
+                    conf['tserver_master_addrs'] = line.split('=')[-1]
+                elif "fs_data_dirs=" in line:
+                    logger.debug(line)
+                    conf['fs_data_dirs'] = line.split('=')[-1].split(',')
+
+                if None not in conf.values():
+                    break
+            except StopIteration:
+                break
+
+        logger.debug(conf)
+
+        if None in conf.values():
+            logger.error('get kudu /varz failed: {}'.format(conf))
+
+        return conf
+
+    def get_tserver_num(self, tserver_master_addrs):
+        cmd = 'kudu tserver list {} -format=space | wc -l'.format(tserver_master_addrs)
+        logger.debug('get tserver number by [{}]'.format(cmd))
+        res = run_cmd(cmd)
+        logger.debug(res)
+        tserver_num = int(res['stdout'].strip())
+
+        return tserver_num
+
+    def get_real_data_size(self):
+        cmd = "kudu remote_replica list \"$(hostname -f)\" 2>&1 | " \
+              "grep 'Estimat' | sed 's/Estimated on disk size: //g' | " \
+              "sed 's/M/*1024/' | sed 's/G/*1024*1024/' | sed 's/K//' | " \
+              "xargs | sed -e 's/\\ /+/g' | bc | xargs -i echo {}/1024 | bc | xargs -i echo {}"
+        logger.debug('get tserver real data size by [{}]'.format(cmd))
+        res = run_cmd(cmd)
+        logger.debug(res)
+
+        self.results['tserver_real_data_MByte'] = int(res['stdout'].strip()) if res['stdout'] else 0
+        logger.debug(self.results)
+
+        return self.results
+
+    def get_data_detial(self, fs_data_dirs):
+        logger.debug('get kudu fs_data_dirs detail')
+        data_sizes = 0
+        data_counts = list()
+        for fs_data_dir in fs_data_dirs:
+            data_dir = os.path.join(fs_data_dir, 'data')
+            logger.debug(data_dir)
+
+            # compute count
+            cmd = 'ls {} | wc -l'.format(data_dir)
+            logger.debug('get dir count by [{}]'.format(cmd))
+            res = run_cmd(cmd)
+            logger.debug(res)
+            data_count = int(run_cmd(cmd)['stdout'].strip()) // 2
+            logger.debug('count is {}'.format(data_count))
+            data_counts.append(data_count)
+
+            # computer size
+            cmd = "du -sm {} | awk '{{print $1}}'".format(data_dir)
+            logger.debug('get dir size by [{}]'.format(cmd))
+            res = run_cmd(cmd)
+            logger.debug(res)
+            data_size = int(run_cmd(cmd)['stdout'].strip())
+            logger.debug('szie is {}'.format(data_size))
+            data_sizes += data_size
+
+        self.results['max_tserver_data_count'] = max(data_counts)
+        self.results['tserver_disk_data_MByte'] = data_sizes
+        logger.debug(self.results)
+
+        return self.results
+
+    def check_user_tag_tablet_num(self):
+        cmd = 'kudu remote_replica list "$(hostname)" | grep -e user_tag -e segmenter  | wc -l'
+        logger.debug('get user_tag number by [{}]'.format(cmd))
+        res = run_cmd(cmd)
+        logger.debug(res)
+        user_tag_tablet_num = res['stdout'].strip() if res['stdout'] else None
+        self.results['user_tag_tablet_num'] = user_tag_tablet_num
+
+        if user_tag_tablet_num is None:
+            self.invalid_msg.append('[{}] failed;'.format(cmd))
+        elif int(user_tag_tablet_num) >= self.valid_user_tag_tablet_num:
+            fix_doc = 'fix doc is coming soon by [Wang Ning], no need to fix now'
+            self.invalid_msg.append('too many user_tag, fix it by [{}];'.format(fix_doc))
+
+    def check(self):
+        logger.debug('check kudu')
+        if self.check_tserver_on_host():
+            kudu_conf = self.parse_html()
+            self.get_data_detial(kudu_conf['fs_data_dirs'])
+            self.get_real_data_size()
+            tserver_number = self.get_tserver_num(kudu_conf['tserver_master_addrs'])
+            coefficient = 3 if tserver_number == 1 else 1
+
+            self.results['tserver_restart_minutes'] = round(self.results['max_tserver_data_count'] / 2 / 60 + 10)
+            self.results['tserver_rebuild_minutes'] = round(
+                self.results['tserver_real_data_MByte'] / 100 / 60 * tserver_number * 2 * coefficient
+            )
+
+            if self.results['max_tserver_data_count'] > self.valid_data_count:
+                self.invalid_msg.append(
+                    'data count [{}] is more than {};'.format(
+                        self.results['max_tserver_data_count'], self.valid_data_count
+                    )
+                )
+
+            compression_ratio = round(self.results['tserver_disk_data_MByte'] / self.results['tserver_real_data_MByte'])
+            if compression_ratio > self.valid_compression_ratio:
+                self.invalid_msg.append(
+                    'data compression ratio [{}] is more than {};'.format(
+                        compression_ratio, self.valid_compression_ratio
+                    )
+                )
+
+            self.check_user_tag_tablet_num()
+
+            if len(self.invalid_msg) > 1:
+                self.invalid_msg.append(
+                    'restart may take {} minutes, rebuild may take {} minutes, rebuild by [{}]'.format(
+                        self.results['tserver_restart_minutes'],
+                        self.results['tserver_rebuild_minutes'],
+                        self.doc,
+                    )
+                )
+                self.results['unmatch'].append(' '.join(self.invalid_msg))
+
+        # json format results
+        results_json = json.dumps(self.results)
+        logger.debug('results: {}'.format(results_json))
+
+        # write results to file
+        logger.debug('write results to {}'.format(self.results_file))
+        with open(self.results_file, 'w', encoding='utf-8') as f:
+            f.write('{}'.format(results_json))
+
+
+if __name__ == '__main__':
+    main = CheckKudu()
+    main.check()
